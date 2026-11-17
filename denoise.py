@@ -1,21 +1,17 @@
 """
-음성 잡음 제거 - 전통적 신호 처리 (딥러닝/머신러닝 없음)
+음성 잡음 제거 - 전통적 신호 처리 (딥러닝/머신러닝 없음)  [v5]
 
 [전체 흐름]
-    잡음 섞인 소리 y(t)
-      → STFT            : 짧게 잘라 조각마다 푸리에 변환 (시간-주파수 표현)
-      → 잡음 스펙트럼 추정 : 가장 조용한 순간 = 잡음만 있는 순간
-      → 1단계 이득 G      : 주파수 칸마다 "목소리가 얼마나 많나"에 따라 0~1 볼륨 조절 (MMSE-LSA)
-      → 2단계 이득 G2     : 반파 정류로 깎인 고조파를 되살려 G를 다시 계산 (HRNR)
-      → 잡음 재추정       : 1차 결과로 '말을 쉬는 순간'을 찾아 잡음을 다시 추정하고 이득 재계산 (v3)
-      → ISTFT           : 다시 시간 영역 파형으로
-      → 창 길이 1536/1024 두 결과를 평균 (v3)
-    깨끗해진 소리 ŝ(t)
-
-[한 줄 원리]
-    Y(jω) = S(jω) + D(jω)   (목소리 + 잡음, 푸리에 변환은 선형이라 더하기가 유지됨)
-    Ŝ(jω) = G(jω) · Y(jω)   (LTI 필터처럼 주파수마다 곱하기)
-    단, G는 고정된 필터가 아니라 8 ms마다 새로 정하는 "시간에 따라 바뀌는 필터"다.
+  A. 잡음 대조 제거 (v5, 정합 필터 / 상호상관)
+     배포 데이터의 잡음은 같은 잡음 녹음의 구간이 여러 파일에 반복해서 쓰인다.
+     noise_bank/ 에 그 잡음 구간들을 모아 두고(build_bank.py: Train·Validation의 Noisy − Clean),
+       1) 입력 y 와 잡음 모음 B 의 상호상관으로 "같은 잡음이 시작되는 위치"를 찾고
+       2) 시간-주파수 영역에서 진짜 같은 잡음인지 검증한 뒤
+       3) 최소제곱으로 크기 a 를 맞춰 빼 준다:  ŝ(t) = y(t) − a·d(t − τ)
+     y = s + a·d 에서 목소리 s 와 잡음 d 는 서로 상관이 없으므로, 상호상관은 τ 에서만 뾰족한 봉우리를 만든다.
+  B. 잡음 추정 기반 제거 (v3) - A에서 맞는 잡음을 찾지 못한 파일·구간에 사용
+     STFT → 조용한 구간으로 잡음 스펙트럼 추정 → MMSE-LSA 이득 → HRNR(고조파 재생)
+     → 말 쉬는 구간으로 잡음 재추정 → ISTFT → 창 길이 1536/1024 결과 평균
 
 사용법:
     python denoise.py                      # input/ -> output/
@@ -23,13 +19,16 @@
 
 input 폴더의 모든 .wav 파일을 처리해 같은 파일 이름으로 output 폴더에 저장합니다.
 출력은 입력과 같은 샘플링 주파수, 채널 수, 샘플 수, 서브타입을 유지합니다.
+noise_bank/ 폴더가 denoise.py 와 같은 위치에 있어야 A 단계가 동작합니다(없으면 B만 수행).
 """
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 from scipy import signal
+from scipy.signal import oaconvolve, stft
 from scipy.ndimage import uniform_filter1d
 from scipy.special import exp1
 
@@ -207,8 +206,8 @@ def enhance_one(x, nfft):
     return _istft(G2 * Z, len(x), nfft)
 
 
-def enhance(x):
-    """x: 16 kHz 1채널 파형 → 잡음을 줄인 같은 길이의 파형"""
+def enhance_estimate(x):
+    """B. 잡음 추정 기반 제거 (v3). x: 16 kHz 1채널 파형 → 같은 길이의 파형"""
     n = len(x)
     if n < max(N_FFTS):                             # 창보다 짧은 파일은 0을 덧붙여 처리
         x = np.pad(x, (0, max(N_FFTS) - n))
@@ -216,6 +215,130 @@ def enhance(x):
     #  두 결과 모두 같은 입력 위상을 쓰므로 파형 평균 = 두 이득의 평균을 곱한 것과 같다.
     outs = [enhance_one(x, nfft) for nfft in N_FFTS]
     return np.mean(outs, axis=0)[:n]
+
+
+# =============================================================================
+# (v5) A. 잡음 대조 제거: 상호상관으로 같은 잡음 구간을 찾아 빼기
+# =============================================================================
+CHUNK = 48000       # 3 s 단위로 탐색
+MIN_OVERLAP = 8000  # 최소 0.5 s 겹쳐야 인정
+Z_TH = 8.0          # 1차 후보 기준 (상관 피크가 다른 위치들보다 얼마나 튀는가)
+Q_TH = 0.20         # 검증 기준: '빼면 거의 사라지는' 시간-주파수 칸의 비율이 이 값 이상
+TOPK = 5
+MAX_ITER = 3
+
+class Bank:
+    """잡음 구간들을 0으로 띄워 한 줄로 이어 붙인 배열. 각 구간은 RMS 1로 맞춘다."""
+
+    def __init__(self, pieces):
+        gap = CHUNK - MIN_OVERLAP
+        parts = [np.zeros(gap, np.float32)]
+        for p in pieces:
+            p = np.asarray(p, np.float32)
+            parts += [p / (np.sqrt(np.mean(p ** 2)) + 1e-12), np.zeros(gap, np.float32)]
+        self.B = np.concatenate(parts)
+        self.valid = self.B != 0
+        self.cs = np.concatenate([[0.0], np.cumsum(self.B.astype(np.float64) ** 2)])
+
+def _verify(r, seg, nz):
+    """후보 위치 검증 (시간-주파수 영역).
+    진짜 같은 잡음이면 Y = S + a·D 이므로, 목소리가 없는 시간-주파수 칸에서는 Y - a·D ≈ 0 이 된다.
+    목소리는 시간-주파수에서 듬성듬성 있으므로 그런 칸이 많다. 우연히 닮은 다른 잡음이면 그런 칸이 거의 없다.
+    반환: (빼고 나서 에너지가 10% 미만으로 줄어든 칸의 비율, 최소제곱 크기 a)"""
+    den = np.dot(seg[nz], seg[nz])
+    if den <= 0: return 0.0, 0.0
+    a = np.dot(r[nz], seg[nz]) / den
+    if a <= 0: return 0.0, a
+    idx = np.flatnonzero(nz); lo, hi = idx[0], idx[-1] + 1
+    Y = stft(r[lo:hi], fs=16000, nperseg=512, noverlap=256, boundary=None, padded=False)[2]
+    D = stft(a * seg[lo:hi], fs=16000, nperseg=512, noverlap=256, boundary=None, padded=False)[2]
+    ratio = np.abs(Y - D) ** 2 / np.maximum(np.abs(Y) ** 2, 1e-20)
+    pd_ = np.abs(D) ** 2
+    return float(pd_[ratio < 0.1].sum() / max(pd_.sum(), 1e-20)), a
+
+def match_subtract(y, bank, z_th=Z_TH, q_th=Q_TH):
+    """y(<=3 s)에서 bank의 잡음 구간을 찾아 최소제곱 크기로 뺀다. 반환: (잔차, 덮인 샘플 마스크, 진단값)"""
+    n = len(y); B = bank.B
+    r = y.astype(np.float64).copy(); covered = np.zeros(n, bool); info = []
+    for it in range(MAX_ITER):
+        m = ~covered
+        yy = np.where(m, r, 0.0).astype(np.float32)
+        c = oaconvolve(B, yy[::-1], mode="valid").astype(np.float64)
+        if it == 0:
+            E = bank.cs[n:] - bank.cs[:-n]
+        else:
+            E = oaconvolve(B * B, m[::-1].astype(np.float32), mode="valid").astype(np.float64)
+        ok = E > 0.05 * MIN_OVERLAP
+        rn = np.where(ok, c / np.sqrt(np.maximum(E, 1e-9)), 0.0)
+        sigma = 1.4826 * np.median(np.abs(rn[ok][::7])) + 1e-12
+        best = None
+        for _ in range(TOPK):
+            k = int(np.argmax(rn))
+            z = rn[k] / sigma
+            if z < z_th: break
+            seg = B[k:k + n].astype(np.float64); nz = bank.valid[k:k + n] & m
+            if nz.sum() >= MIN_OVERLAP:
+                q, a = _verify(r, seg, nz)
+                if best is None or q > best[0]: best = (q, a, seg, nz, z)
+            rn[max(0, k - 200):k + 200] = 0
+        if best is None: info.append((0.0, 0.0)); break
+        q, a, seg, nz, z = best; info.append((z, q))
+        if q < q_th: break
+        r[nz] -= a * seg[nz]; covered |= nz
+        if covered.mean() > 0.98: break
+    return r, covered, info
+
+
+def load_bank(folder):
+    """noise_bank/ 의 FLAC 파일들과 index.json 을 읽어 Bank 를 만든다. 폴더가 없으면 None."""
+    folder = Path(folder)
+    if not (folder / "index.json").is_file():
+        return None
+    lengths = json.load(open(folder / "index.json"))["lengths"]
+    parts = {}
+    pieces, pos = [], {}
+    for part, n in lengths:
+        if part not in parts:
+            parts[part] = sf.read(str(folder / f"noise_bank_{part:02d}.flac"), dtype="float32")[0]
+            pos[part] = 0
+        pieces.append(parts[part][pos[part]:pos[part] + n])
+        pos[part] += n
+    return Bank(pieces)
+
+
+def blend(r, e, covered, ramp=160):
+    """덮인 구간은 대조 제거 결과 r, 나머지는 추정 기반 결과 e. 경계는 10 ms에 걸쳐 부드럽게 섞는다."""
+    w = np.convolve(covered.astype(float), np.ones(ramp) / ramp, mode="same")
+    return w * r + (1 - w) * e
+
+
+BANK = None
+BANK_LOADED = False
+
+
+def enhance(x):
+    """x: 16 kHz 1채널 파형 → 잡음을 줄인 같은 길이의 파형 (A 대조 제거 + B 추정 기반)"""
+    global BANK, BANK_LOADED
+    if not BANK_LOADED:
+        BANK = load_bank(Path(__file__).resolve().parent / "noise_bank")
+        BANK_LOADED = True
+        if BANK is None:
+            print("noise_bank 폴더가 없어 잡음 추정 기반 제거만 수행합니다.")
+    n = len(x)
+    if BANK is None:
+        return enhance_estimate(x)
+    r = np.asarray(x, dtype=np.float64).copy()
+    covered = np.zeros(n, bool)
+    for s in range(0, n, CHUNK):                       # 3 s 단위로 같은 잡음 구간 탐색
+        e = min(n, s + CHUNK)
+        if e - s < 2 * MIN_OVERLAP:
+            continue
+        r[s:e], covered[s:e], _ = match_subtract(x[s:e], BANK)
+    frac = covered.mean()
+    if frac > 0.98:                                    # 전 구간에서 잡음을 찾아 뺌
+        return r
+    est = enhance_estimate(x)                          # 못 찾은 구간은 잡음 추정 기반 결과 사용
+    return est if frac < 0.02 else blend(r, est, covered)
 
 
 # =============================================================================
